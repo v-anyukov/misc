@@ -1,0 +1,267 @@
+# Playing with process message queue
+
+## What is it all about?
+
+In Elixir, messages sent between processes find a temporary home in the recipient's message queue, waiting to be explicitly received and processed. However, what occurs when these messages aren't explicitly handled? Do they reside indefinitely in the message queue? Lets try to figure out.
+
+## Simple Elixir process example
+
+Let's create simple process which runs forever and waits for `:ping` message:
+
+```elixir
+defmodule MyProcess do
+  def start_link do
+    Task.start_link(fn -> loop() end)
+  end
+
+  defp loop() do
+    receive do
+      :ping ->
+        loop()
+    end
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, MyProcess, <<70, 79, 82, 49, 0, 0, 6, ...>>, {:loop, 0}}
+```
+
+We are not interested in any response or anything, so we just recursively call our loop function.
+
+<!-- livebook:{"break_markdown":true} -->
+
+Also, we will need some way to figure out the process mailbox length and memory usage, so let's write a simple stats function which will return this data.
+
+```elixir
+stats = fn pid ->
+  {_, mem} = Process.info(pid, :memory)
+  {_, messages_count} = Process.info(pid, :message_queue_len)
+  "Memory usage: #{mem}; messages: #{messages_count}"
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+#Function<44.65746770/1 in :erl_eval.expr/5>
+```
+
+Now we are ready, let's start our process:
+
+```elixir
+{:ok, pid} = MyProcess.start_link()
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:ok, #PID<0.1908.0>}
+```
+
+And send some messages to it:
+
+```elixir
+for _ <- 1..100_000, do: send(pid, :ping)
+
+stats.(pid)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+"Memory usage: 2736; messages: 0"
+```
+
+Looks good so far - we send :ping, our process handles it and removes it from the mailbox.
+
+But what if we send something unexpected?
+
+```elixir
+for _ <- 1..100_000, do: send(pid, :pong)
+
+stats.(pid)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+"Memory usage: 8802736; messages: 100000"
+```
+
+100_000 messages sitting in the process mailbox - it looks a bit scary, to be honest. A quick Google search reveals there is no limit (neither in message count nor in used memory) for an Erlang process message queue. Should I start to worry about all my beloved GenServers? Let's give it a try.
+
+## GenServer example
+
+Let's create a simple GenServer:
+
+```elixir
+defmodule MyServer do
+  use GenServer
+
+  def start_link() do
+    GenServer.start_link(__MODULE__, %{})
+  end
+
+  @impl true
+  def init(_) do
+    {:ok, %{}}
+  end
+
+  @impl true
+  def handle_cast(:ping, _state) do
+    {:noreply, %{}}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, MyServer, <<70, 79, 82, 49, 0, 0, 17, ...>>, {:handle_cast, 2}}
+```
+
+And start it:
+
+```elixir
+{:ok, pid1} = MyServer.start_link()
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:ok, #PID<0.1918.0>}
+```
+
+Casting expected `:ping`:
+
+```elixir
+for _ <- 1..100_000, do: GenServer.cast(pid1, :ping)
+
+stats.(pid1)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+"Memory usage: 21552; messages: 0"
+```
+
+Looks good so far.
+
+<!-- livebook:{"break_markdown":true} -->
+
+What about unexpected `:pong`?
+
+```elixir
+GenServer.cast(pid1, :pong)
+```
+
+`Evaluation process terminated - an exception was raised:
+    ** (FunctionClauseError) no function clause matching in MyServer.handle_cast/2`
+So, GenServer raises an error when you attempt to call or cast something unexpected. This is great news - it ensures no unexpected messages pile up in our process queue, and you're likely to catch this error early enough to prevent it from reaching production. A sigh of relief, right? =)
+
+<!-- livebook:{"break_markdown":true} -->
+
+But what happens if we attempt to send something instead? As you may recall, we haven't implemented a handle_info callback in our MyServer module. Therefore, any message sent via send would be considered unexpected.
+
+```elixir
+for _ <- 1..10, do: send(pid1, :pong)
+
+stats.(pid1)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+
+18:38:38.523 [error] MyServer #PID<0.1769.0> received unexpected message in handle_info/2: :pong
+
+
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+"Memory usage: 30160; messages: 7"
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+
+18:38:38.523 [error] MyServer #PID<0.1769.0> received unexpected message in handle_info/2: :pong
+
+
+18:38:38.524 [error] MyServer #PID<0.1769.0> received unexpected message in handle_info/2: :pong
+
+
+18:38:38.524 [error] MyServer #PID<0.1769.0> received unexpected message in handle_info/2: :pong
+
+
+18:38:38.524 [error] MyServer #PID<0.1769.0> received unexpected message in handle_info/2: :pong
+
+
+18:38:38.524 [error] MyServer #PID<0.1769.0> received unexpected message in handle_info/2: :pong
+
+
+18:38:38.524 [error] MyServer #PID<0.1769.0> received unexpected message in handle_info/2: :pong
+
+
+18:38:38.524 [error] MyServer #PID<0.1769.0> received unexpected message in handle_info/2: :pong
+
+
+18:38:38.524 [error] MyServer #PID<0.1769.0> received unexpected message in handle_info/2: :pong
+
+
+18:38:38.524 [error] MyServer #PID<0.1769.0> received unexpected message in handle_info/2: :pong
+
+
+```
+
+Hm, curious. Error logs and 7 messages in the queue. Let's try to run our stats again:
+
+```elixir
+stats.(pid1)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+"Memory usage: 29456; messages: 0"
+```
+
+And 0 messages again - sweet!
+
+<!-- livebook:{"break_markdown":true} -->
+
+So, in general, it appears that my beloved GenServers are safe, everyone can relax =) Elixir either prevents us from sending unexpected messages or it handles them for us.
+
+<!-- livebook:{"break_markdown":true} -->
+
+But if you're curious about how and why, let's take a closer look at our `MyServer` module:
+
+```elixir
+MyServer.__info__(:functions)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+[
+  child_spec: 1,
+  code_change: 3,
+  handle_call: 3,
+  handle_cast: 2,
+  handle_info: 2,
+  init: 1,
+  start_link: 0,
+  terminate: 2
+]
+```
+
+We have a bunch of functions provided to us by `use GenServer`. For instance, the default implementation of handle_call [raises an error](https://github.com/elixir-lang/elixir/blob/v1.14.4/lib/elixir/lib/gen_server.ex#L787) when no handle_call is provided. The same goes for [handle_cast](https://github.com/elixir-lang/elixir/blob/v1.14.4/lib/elixir/lib/gen_server.ex#L832).
+
+However, for handle_info, it [behaves slightly differently](https://github.com/elixir-lang/elixir/blob/v1.14.4/lib/elixir/lib/gen_server.ex#L795).
